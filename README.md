@@ -21,7 +21,7 @@ A stored procedure for **Microsoft Fabric Data Warehouse** and **Fabric SQL Anal
 
 ## Installation
 
-Run the contents of [`findchanges.sql.txt`](findchanges.sql.txt) in your Fabric SQL editor to create the stored procedure:
+Run the contents of [`findchanges.sql`](findchanges.sql) in your Fabric SQL editor to create the stored procedure:
 
 ```sql
 -- Execute the script in your Fabric DW / SQL Analytics Endpoint
