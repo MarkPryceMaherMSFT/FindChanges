@@ -1,8 +1,19 @@
 # FindChanges – Detect Table Changes in Microsoft Fabric
 
-A stored procedure for **Microsoft Fabric Data Warehouse** and **Fabric SQL Analytics Endpoint** that identifies row-level changes (inserts, updates, and deletes) between two points in time using Fabric's built-in time-travel capability (`FOR TIMESTAMP AS OF`).
+Stored procedures for **Microsoft Fabric Data Warehouse** and **Fabric SQL Analytics Endpoint** that identify row-level changes (inserts, updates, and deletes) between two points in time using Fabric's built-in time-travel capability (`FOR TIMESTAMP AS OF`).
 
-## How It Works
+## Procedures
+
+| Procedure | Description |
+|-----------|-------------|
+| [`FindChanges`](findchanges.sql) | Simple change detection – returns rows that differ between two timestamps |
+| [`FindChanges_SCD`](findchanges_scd.sql) | Change detection with Type 2 SCD – classifies changes by business key and maintains a historical dimension table |
+
+---
+
+## FindChanges (Simple)
+
+### How It Works
 
 1. Takes a snapshot of the target table at the **start** timestamp.
 2. Takes a snapshot of the same table at the **end** timestamp.
@@ -13,25 +24,9 @@ A stored procedure for **Microsoft Fabric Data Warehouse** and **Fabric SQL Anal
 
 > **Note:** Updated rows will appear twice — once as `Removed` (the old values) and once as `Inserted/Updated` (the new values) — because the comparison is performed on the full row.
 
-## Prerequisites
-
-- A Microsoft Fabric Data Warehouse or SQL Analytics Endpoint.
-- Time-travel must be available for the target table (this is enabled by default in Fabric).
-- The timestamps provided must fall within the retention period.
-
-## Installation
-
-Run the contents of [`findchanges.sql`](findchanges.sql) in your Fabric SQL editor to create the stored procedure:
+### Usage
 
 ```sql
--- Execute the script in your Fabric DW / SQL Analytics Endpoint
--- to create the [dbo].[FindChanges] procedure.
-```
-
-## Usage
-
-```sql
--- Declare the time window and target table
 DECLARE @startdt VARCHAR(26);
 DECLARE @enddt VARCHAR(26);
 DECLARE @tablename VARCHAR(50);
@@ -40,7 +35,6 @@ SET @startdt   = '2026-06-06T14:45:35.28';
 SET @enddt     = '2026-06-06T15:05:55.28';
 SET @tablename = '[dbo].[foo2]';
 
--- Execute the procedure
 EXEC [dbo].[FindChanges] @tablename, @startdt, @enddt;
 ```
 
@@ -52,11 +46,90 @@ EXEC [dbo].[FindChanges] @tablename, @startdt, @enddt;
 | Inserted/Updated | 3  | itemC  | 150   |
 | Inserted/Updated | 7  | itemG  | 42    |
 
-In this example:
-- Row `id=3` was **updated** (value changed from 100 → 150).
-- Row `id=7` was **inserted** (new row that didn't exist at the start time).
+---
 
-## Parameters
+## FindChanges_SCD (Type 2 Slowly Changing Dimension)
+
+### How It Works
+
+1. Snapshots the table at the start and end timestamps (same as `FindChanges`).
+2. Uses the **business key** (`@keycolumn`) to classify each change:
+   - **New** – key exists in end snapshot but not in start snapshot
+   - **Updated** – key exists in both but one or more non-key columns differ
+   - **Deleted** – key exists in start snapshot but not in end snapshot
+3. Creates a Type 2 SCD table (`{source_table}_SCD`) if it doesn't already exist.
+4. Applies changes to the SCD table:
+   - **New rows** → inserted with `_SCD_StartDate = @enddt`
+   - **Updated rows** → old active record is closed (`_SCD_EndDate = @enddt`), new version inserted
+   - **Deleted rows** → active record is closed and `_SCD_DeletedFlag` set to `1`
+
+### SCD Table Schema
+
+The SCD table contains all source columns plus four metadata columns:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `_SCD_StartDate` | `DATETIME2` | When this version of the row became active |
+| `_SCD_EndDate` | `DATETIME2` | When this version was superseded (`NULL` = current active record) |
+| `_SCD_DeletedFlag` | `BIT` | `1` if the source row was deleted |
+| `_SCD_LastUpdated` | `DATETIME2` | Last time this SCD record was modified |
+
+### Usage
+
+```sql
+DECLARE @startdt VARCHAR(26);
+DECLARE @enddt VARCHAR(26);
+DECLARE @tablename VARCHAR(50);
+DECLARE @keycolumn VARCHAR(50);
+
+SET @startdt    = '2026-06-06T14:45:35.28';
+SET @enddt      = '2026-06-06T15:05:55.28';
+SET @tablename  = '[dbo].[foo2]';
+SET @keycolumn  = 'ProductID';
+
+EXEC [dbo].[FindChanges_SCD] @tablename, @keycolumn, @startdt, @enddt;
+```
+
+### Example Output
+
+The procedure returns a summary of detected changes:
+
+| action  | ProductID | name   | value |
+|---------|-----------|--------|-------|
+| New     | 7         | itemG  | 42    |
+| Updated | 3         | itemC  | 150   |
+| Deleted | 5         | itemE  | 80    |
+
+And the SCD table (`[dbo].[foo2_SCD]`) will contain the full history:
+
+| ProductID | name  | value | _SCD_StartDate | _SCD_EndDate | _SCD_DeletedFlag | _SCD_LastUpdated |
+|-----------|-------|-------|----------------|--------------|------------------|------------------|
+| 3 | itemC | 100 | 2026-06-06 14:45:35 | 2026-06-06 15:05:55 | 0 | 2026-06-06 15:05:55 |
+| 3 | itemC | 150 | 2026-06-06 15:05:55 | NULL | 0 | 2026-06-06 15:05:55 |
+| 5 | itemE | 80  | 2026-06-06 14:45:35 | 2026-06-06 15:05:55 | 1 | 2026-06-06 15:05:55 |
+| 7 | itemG | 42  | 2026-06-06 15:05:55 | NULL | 0 | 2026-06-06 15:05:55 |
+
+### Querying the SCD Table
+
+```sql
+-- Get current active records only
+SELECT * FROM [dbo].[foo2_SCD] WHERE _SCD_EndDate IS NULL AND _SCD_DeletedFlag = 0;
+
+-- Get the state of a specific record at a point in time
+SELECT * FROM [dbo].[foo2_SCD]
+WHERE ProductID = 3
+  AND _SCD_StartDate <= '2026-06-06T15:00:00'
+  AND (_SCD_EndDate IS NULL OR _SCD_EndDate > '2026-06-06T15:00:00');
+
+-- Get all deleted records
+SELECT * FROM [dbo].[foo2_SCD] WHERE _SCD_DeletedFlag = 1;
+```
+
+---
+
+## Parameters Reference
+
+### FindChanges
 
 | Parameter    | Type          | Description                                          |
 |--------------|---------------|------------------------------------------------------|
@@ -64,11 +137,53 @@ In this example:
 | `@startdt`   | `VARCHAR(26)` | Start timestamp (ISO 8601), the "before" snapshot    |
 | `@enddt`     | `VARCHAR(26)` | End timestamp (ISO 8601), the "after" snapshot       |
 
+### FindChanges_SCD
+
+| Parameter    | Type          | Description                                          |
+|--------------|---------------|------------------------------------------------------|
+| `@tablename` | `VARCHAR(50)` | Schema-qualified table name, e.g. `[dbo].[foo2]`    |
+| `@keycolumn` | `VARCHAR(50)` | Business key column name, e.g. `ProductID`           |
+| `@startdt`   | `VARCHAR(26)` | Start timestamp (ISO 8601), the "before" snapshot    |
+| `@enddt`     | `VARCHAR(26)` | End timestamp (ISO 8601), the "after" snapshot       |
+
+---
+
+## Prerequisites
+
+- A Microsoft Fabric Data Warehouse or SQL Analytics Endpoint.
+- Time-travel must be available for the target table (enabled by default in Fabric).
+- The timestamps provided must fall within the retention period.
+- For `FindChanges_SCD`: the business key column must uniquely identify rows.
+
+## Installation
+
+Run the SQL scripts in your Fabric SQL editor:
+
+```sql
+-- 1. Create the simple FindChanges procedure
+--    Execute the contents of findchanges.sql
+
+-- 2. Create the SCD version
+--    Execute the contents of findchanges_scd.sql
+```
+
+## Demo Scripts
+
+End-to-end test scripts are included to demonstrate each procedure:
+
+| Script | Description |
+|--------|-------------|
+| [`demo_findchanges.sql`](demo_findchanges.sql) | Creates a test table, makes changes (insert/update/delete), and runs `FindChanges` to show detected differences |
+| [`demo_findchanges_scd.sql`](demo_findchanges_scd.sql) | Full SCD lifecycle: creates a test table, runs two incremental loads, and demonstrates query patterns for the SCD history table |
+
+Run these scripts in your Fabric SQL editor to see the procedures in action. They include `WAITFOR DELAY` pauses to ensure time-travel can distinguish between the before/after snapshots.
+
 ## Limitations
 
-- The procedure creates temporary staging tables (`Orginal_tbl`, `new_tbl`) in the `dbo` schema. Concurrent executions may conflict.
-- Very large tables will consume storage for the two snapshot copies.
-- The `EXCEPT` comparison is across all columns; if a row's non-key columns haven't changed, it won't appear in the results.
+- Staging tables are created in the `dbo` schema. Concurrent executions may conflict.
+- Very large tables will consume storage for the snapshot copies.
+- The `EXCEPT` comparison is across all columns; if no non-key columns changed, the row won't be detected as updated.
+- The SCD table must have the same schema as the source table. If the source schema changes, the SCD table may need manual updates.
 
 ## License
 
