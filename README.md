@@ -8,6 +8,7 @@ Stored procedures for **Microsoft Fabric Data Warehouse** and **Fabric SQL Analy
 |-----------|-------------|
 | [`FindChanges`](findchanges.sql) | Simple change detection – returns rows that differ between two timestamps |
 | [`FindChanges_SCD`](findchanges_scd.sql) | Change detection with Type 2 SCD – classifies changes by business key and maintains a historical dimension table |
+| [`findchanges_safe`](findchanges_safe.sql) | Safe point-in-time query – returns table state at a given timestamp with input validation and timestamp clamping |
 
 ---
 
@@ -45,6 +46,60 @@ EXEC [dbo].[FindChanges] @tablename, @startdt, @enddt;
 | Removed          | 3  | itemC  | 100   |
 | Inserted/Updated | 3  | itemC  | 150   |
 | Inserted/Updated | 7  | itemG  | 42    |
+
+---
+
+## findchanges_safe (Safe Point-in-Time Query)
+
+### How It Works
+
+1. Validates and normalises the table name (accepts one-part `Orders` or two-part `dbo.Orders`).
+2. Verifies the table exists in the warehouse via `sys.tables`.
+3. Clamps the requested timestamp:
+   - If **before** the table's `create_date` → uses the table creation time
+   - If **in the future** → uses current UTC time
+4. Executes a time-travel query (`FOR TIMESTAMP AS OF`) and returns the full table state at that point in time.
+
+### Features
+
+- **Input validation** – rejects NULL, empty, or three-part+ names with clear error messages
+- **SQL injection protection** – uses `PARSENAME` for parsing and `QUOTENAME` for output
+- **Timestamp clamping** – never fails due to out-of-range timestamps
+- **Strongly typed** – uses `DATETIME2(3)` for the timestamp parameter (UTC)
+
+### Usage
+
+```sql
+-- Query table state at a specific point in time
+DECLARE @pit DATETIME2(3) = '2026-06-06T14:45:35.280';
+
+EXEC [dbo].[findchanges_safe]
+    @TableName   = 'dbo.Orders',
+    @PointInTime = @pit;
+```
+
+```sql
+-- One-part table name (defaults to dbo schema)
+EXEC [dbo].[findchanges_safe]
+    @TableName   = 'Orders',
+    @PointInTime = '2026-06-06T15:00:00.000';
+```
+
+```sql
+-- Future timestamp is automatically clamped to current UTC time
+EXEC [dbo].[findchanges_safe]
+    @TableName   = 'dbo.Orders',
+    @PointInTime = '2030-12-31T23:59:59.999';
+```
+
+### Error Handling
+
+| Error | Condition |
+|-------|-----------|
+| 50000 | Table name is NULL or empty |
+| 50001 | Three-part or four-part name provided (only one/two-part allowed) |
+| 50002 | Table name could not be parsed |
+| 50003 | Table does not exist in the warehouse |
 
 ---
 
@@ -137,6 +192,13 @@ SELECT * FROM [dbo].[foo2_SCD] WHERE _SCD_DeletedFlag = 1;
 | `@startdt`   | `VARCHAR(26)` | Start timestamp (ISO 8601), the "before" snapshot    |
 | `@enddt`     | `VARCHAR(26)` | End timestamp (ISO 8601), the "after" snapshot       |
 
+### findchanges_safe
+
+| Parameter      | Type            | Description                                          |
+|----------------|-----------------|------------------------------------------------------|
+| `@TableName`   | `NVARCHAR(256)` | Table name: `table` or `schema.table`                |
+| `@PointInTime` | `DATETIME2(3)`  | UTC timestamp to query the table at                  |
+
 ### FindChanges_SCD
 
 | Parameter    | Type          | Description                                          |
@@ -163,7 +225,10 @@ Run the SQL scripts in your Fabric SQL editor:
 -- 1. Create the simple FindChanges procedure
 --    Execute the contents of findchanges.sql
 
--- 2. Create the SCD version
+-- 2. Create the safe point-in-time query procedure
+--    Execute the contents of findchanges_safe.sql
+
+-- 3. Create the SCD version
 --    Execute the contents of findchanges_scd.sql
 ```
 
@@ -174,6 +239,7 @@ End-to-end test scripts are included to demonstrate each procedure:
 | Script | Description |
 |--------|-------------|
 | [`demo_findchanges.sql`](demo_findchanges.sql) | Creates a test table, makes changes (insert/update/delete), and runs `FindChanges` to show detected differences |
+| [`demo_findchanges_safe.sql`](demo_findchanges_safe.sql) | Tests `findchanges_safe` with timestamp clamping, name format variations, and error handling |
 | [`demo_findchanges_scd.sql`](demo_findchanges_scd.sql) | Full SCD lifecycle: creates a test table, runs two incremental loads, and demonstrates query patterns for the SCD history table |
 
 Run these scripts in your Fabric SQL editor to see the procedures in action. They include `WAITFOR DELAY` pauses to ensure time-travel can distinguish between the before/after snapshots.
